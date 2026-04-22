@@ -1,0 +1,347 @@
+/* ── Reset & Base ──────────────────────────────────────────────────────────── */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    Helvetica, Arial, sans-serif;
+  background-color: #f4f6f8;
+  color: #333;
+  padding: 20px;
+}
+
+/* ── Container ────────────────────────────────────────────────────────────── */
+.container {
+  max-width: 1100px;
+  margin: 0 auto;
+  background: #fff;
+  padding: 30px;
+  border-radius: 12px;
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.05);
+}
+
+h1 {
+  color: #1a365d;
+  margin-bottom: 6px;
+}
+
+.subtitle {
+  color: #718096;
+  font-size: 14px;
+  margin-bottom: 24px;
+}
+
+.tab-content {
+  animation: fadeIn 0.2s ease;
+}
+
+.tab-description {
+  color: #4a5568;
+  font-size: 14px;
+  margin-bottom: 20px;
+  line-height: 1.6;
+}
+
+/* ── Dashboard cards ──────────────────────────────────────────────────────── */
+.dashboard {
+  display: flex;
+  gap: 20px;
+  margin-bottom: 24px;
+  flex-wrap: wrap;
+}
+
+.card {
+  flex: 1;
+  min-width: 200px;
+  background: #edf2f7;
+  padding: 20px;
+  border-radius: 8px;
+  text-align: center;
+}
+
+.card h3 {
+  margin: 0 0 8px;
+  color: #4a5568;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.card .value {
+  font-size: 32px;
+  font-weight: bold;
+  color: #2b6cb0;
+}
+
+.card .delta {
+  font-size: 13px;
+  margin-top: 4px;
+}
+
+.delta-safe {
+  color: #38a169;
+}
+
+.delta-warning {
+  color: #dd6b20;
+}
+
+.delta-danger {
+  color: #e53e3e;
+}
+
+.peak-date {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #718096;
+  letter-spacing: 0.02em;
+}
+
+.status-safe {
+  color: #38a169 !important;
+}
+
+.status-warning {
+  color: #dd6b20 !important;
+}
+
+.status-danger {
+  color: #e53e3e !important;
+}
+
+/* ── Controls ─────────────────────────────────────────────────────────────── */
+.controls {
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  padding: 20px;
+  border-radius: 8px;
+  margin-bottom: 24px;
+}
+
+.controls h2 {
+  font-size: 16px;
+  color: #2d3748;
+  margin-bottom: 16px;
+}
+
+.control-group {
+  margin-bottom: 18px;
+}
+
+.control-group:last-child {
+  margin-bottom: 0;
+}
+
+.control-label {
+  display: flex;
+  justify-content: space-between;
+  font-weight: 600;
+  font-size: 14px;
+  margin-bottom: 8px;
+  color: #2d3748;
+}
+
+.control-label .slider-value {
+  color: #2b6cb0;
+  font-weight: 700;
+}
+
+input[type="range"] {
+  width: 100%;
+  cursor: pointer;
+  height: 6px;
+  accent-color: #2b6cb0;
+  -webkit-appearance: none;
+  appearance: none;
+  background: #e2e8f0;
+  border-radius: 3px;
+  outline: none;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #2b6cb0;
+  cursor: pointer;
+}
+
+/* ── Chart ────────────────────────────────────────────────────────────────── */
+.chart-container {
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 10px;
+  background: #fafafa;
+}
+
+/* ── Tabs ──────────────────────────────────────────────────────────────────── */
+.tabs {
+  display: flex;
+  gap: 0;
+  margin-bottom: 24px;
+  border-bottom: 2px solid #e2e8f0;
+}
+
+.tab {
+  padding: 12px 24px;
+  font-size: 15px;
+  font-weight: 600;
+  color: #718096;
+  background: none;
+  border: none;
+  border-bottom: 3px solid transparent;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  margin-bottom: -2px;
+}
+
+.tab:hover {
+  color: #2b6cb0;
+  background: #ebf4ff;
+}
+
+.tab-active {
+  color: #2b6cb0;
+  border-bottom-color: #2b6cb0;
+}
+
+/* ── Citizenship Section ──────────────────────────────────────────────────── */
+.citizenship-section {
+  animation: fadeIn 0.2s ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.citizenship-note {
+  background: #ebf8ff;
+  border-left: 4px solid #2b6cb0;
+  padding: 14px 18px;
+  border-radius: 6px;
+  font-size: 14px;
+  color: #2d3748;
+  margin-bottom: 24px;
+  line-height: 1.6;
+}
+
+.cit-card {
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 24px;
+  margin-bottom: 20px;
+}
+
+.cit-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+.cit-header h3 {
+  font-size: 16px;
+  color: #2d3748;
+  margin: 0;
+}
+
+.cit-period {
+  font-size: 12px;
+  color: #a0aec0;
+  background: #f7fafc;
+  padding: 4px 10px;
+  border-radius: 12px;
+  font-weight: 500;
+}
+
+.cit-metrics {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 14px;
+}
+
+.cit-value {
+  font-size: 40px;
+  font-weight: 800;
+}
+
+.cit-unit {
+  font-size: 16px;
+  font-weight: 500;
+  color: #a0aec0;
+}
+
+.cit-delta {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+/* Progress bar */
+.progress-bar-container,
+.progress-overflow-bar {
+  width: 100%;
+  height: 12px;
+  background: #e2e8f0;
+  border-radius: 6px;
+  overflow: hidden;
+  margin-top: 4px;
+}
+
+.progress-overflow-bar {
+  margin-top: 4px;
+  background: #fed7d7;
+  height: 6px;
+}
+
+.progress-bar {
+  height: 100%;
+  border-radius: 6px;
+  transition: width 0.3s ease;
+}
+
+.progress-safe {
+  background: linear-gradient(90deg, #48bb78, #38a169);
+}
+
+.progress-warning {
+  background: linear-gradient(90deg, #ed8936, #dd6b20);
+}
+
+.progress-danger {
+  background: linear-gradient(90deg, #fc8181, #e53e3e);
+}
+
+/* Status banner */
+.cit-status-banner {
+  text-align: center;
+  padding: 18px;
+  border-radius: 10px;
+  font-size: 17px;
+  font-weight: 700;
+  margin-top: 8px;
+}
+
+.banner-safe {
+  background: #f0fff4;
+  color: #276749;
+  border: 1px solid #c6f6d5;
+}
+
+.banner-warning {
+  background: #fffaf0;
+  color: #9c4221;
+  border: 1px solid #feebc8;
+}
+
+.banner-danger {
+  background: #fff5f5;
+  color: #9b2c2c;
+  border: 1px solid #fed7d7;
+}
