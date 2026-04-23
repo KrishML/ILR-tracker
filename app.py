@@ -11,12 +11,30 @@ import db
 st.set_page_config(page_title="UK ILR Absence Tracker", layout="wide")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-START_DATE   = "2022-10-22"
-END_DATE     = "2027-11-24"
-UKVI_LIMIT   = 180
-EXCEL_FILE   = os.path.join(os.path.dirname(__file__), "ILR Vacation Tracker.xlsx")
-EXCEL_SHEETS = ["2022", "2023", "2024", "2025", "2026"]
-TODAY        = date.today()
+START_DATE    = "2022-10-22"
+END_DATE      = "2027-11-24"
+UKVI_LIMIT    = 180
+EXCEL_FILE    = os.path.join(os.path.dirname(__file__), "ILR Vacation Tracker.xlsx")
+EXCEL_SHEETS  = ["2022", "2023", "2024", "2025", "2026"]
+TODAY         = date.today()
+
+# ILR qualifying period anchor dates
+# Per Appendix Continuous Residence CR 1.1 + CR 2.1(d):
+# The qualifying period is based on continuous *residence* in the UK with permission.
+# Time spent outside the UK before first entry cannot count as UK residence.
+# Therefore the 5-year clock starts from the later of:
+#   (a) visa grant date, or (b) first UK entry date
+# Visa granted: 21 Oct 2022 | First UK entry: 24 Nov 2022
+# → Qualifying period start = 24 Nov 2022 (entry date, as it is later)
+# → Earliest possible ILR date = 24 Nov 2027
+VISA_GRANT_DATE  = date(2022, 10, 21)   # for display only
+UK_ENTRY_DATE    = date(2022, 11, 24)   # qualifying period anchor (later of grant/entry)
+ILR_COMPLETION   = date(2027, 11, 24)   # UK_ENTRY_DATE + 5 years (qualifying period end)
+# CR 1.1: applicant may apply up to 28 days before the 5-year completion date;
+# the Home Office counts the qualifying period as ending on the most beneficial date
+# (up to 28 days after application), effectively the completion date itself.
+ILR_28DAY_EARLIEST = ILR_COMPLETION - timedelta(days=28)   # 27 Oct 2027
+ILR_SEARCH_END   = ILR_COMPLETION   # end of tracked period
 
 
 # ── DB init + Excel seed (runs once per process) ──────────────────────────────
@@ -123,45 +141,28 @@ def apply_buffer_days(
 
 
 # ── ILR eligibility assessment ────────────────────────────────────────────────
-def assess_ilr(
-    application_date: date,
+def _build_absence_series(
+    date_range: pd.DatetimeIndex,
     all_trips_full: list[dict],
     extra_2026: int,
     extra_2027: int,
     buf_start_2026: pd.Timestamp,
     buf_end_2026: pd.Timestamp,
     buf_start_2027: pd.Timestamp,
-) -> dict:
+) -> pd.Series:
     """
-    Assess ILR eligibility under Appendix Continuous Residence (5-year Skilled Worker route).
-
-    Rules checked:
-      1. Qualifying period: 5 years immediately before application_date
-         (application_date - 5 years → application_date)
-      2. No rolling 12-month window within that period may exceed 180 absence days
-         (UKVI whole-days rule: departure and arrival days are NOT counted)
-      3. No single trip may exceed 180 consecutive absence days
-
-    Buffer days from sliders are included as synthetic absence days.
-    Returns a dict with keys: eligible, breaches, worst_window, total_absences,
-    qualifying_start, qualifying_end, checked_windows.
+    Build a daily absence Series (0/1) for the given date_range,
+    applying all DB trips plus slider buffer days.
     """
-    q_end   = pd.Timestamp(application_date)
-    q_start = q_end - pd.DateOffset(years=5)
-
-    # Build a daily absence series for the qualifying period
-    date_range = pd.date_range(start=q_start, end=q_end, freq="D")
-    absence = pd.Series(0, index=date_range)
+    absence = pd.Series(0, index=date_range, dtype=int)
 
     for t in all_trips_full:
         ts = pd.Timestamp(t["date_out"])
         te = pd.Timestamp(t["date_in"])
-        # UKVI whole-days: strictly between departure and return
         mask = (date_range > ts) & (date_range < te)
         absence[mask] = 1
 
-    # Apply slider buffer days (2026 window)
-    def _apply_buffer(start: pd.Timestamp, end_cap: pd.Timestamp | None, n: int) -> None:
+    def _fill(start: pd.Timestamp, end_cap: pd.Timestamp | None, n: int) -> None:
         remaining = n
         for d in date_range:
             if remaining <= 0:
@@ -173,41 +174,76 @@ def assess_ilr(
                 remaining -= 1
 
     if extra_2026 > 0:
-        _apply_buffer(buf_start_2026, buf_end_2026, extra_2026)
+        _fill(buf_start_2026, buf_end_2026, extra_2026)
     if extra_2027 > 0:
-        _apply_buffer(buf_start_2027, None, extra_2027)
+        _fill(buf_start_2027, None, extra_2027)
+
+    return absence
+
+
+def assess_ilr(
+    application_date: date,
+    uk_entry_date: date,
+    all_trips_full: list[dict],
+    extra_2026: int,
+    extra_2027: int,
+    buf_start_2026: pd.Timestamp,
+    buf_end_2026: pd.Timestamp,
+    buf_start_2027: pd.Timestamp,
+) -> dict:
+    """
+    Assess ILR eligibility under Appendix Continuous Residence (5-year Skilled Worker route).
+
+    Rules checked:
+      1. Qualifying period: 5 years of continuous UK residence ending on application_date.
+         The period cannot start before uk_entry_date (first day of actual UK residence).
+      2. No rolling 12-month window within that period may exceed 180 absence days
+         (UKVI whole-days rule: departure and arrival days are NOT counted)
+      3. No single trip may exceed 180 consecutive absence days
+    """
+    q_end   = pd.Timestamp(application_date)
+    # CR 1.1: the Home Office uses whichever date is most beneficial — up to 28 days
+    # after the application date. For a 28-day-early application this means the
+    # qualifying period is assessed as if it ends on the 5-year completion date.
+    completion_ts = pd.Timestamp(ILR_COMPLETION)
+    if q_end < completion_ts and (completion_ts - q_end).days <= 28:
+        q_end = completion_ts   # use completion date as the qualifying period end
+    # Qualifying period starts 5 years before q_end, but no earlier than entry date
+    q_start = max(q_end - pd.DateOffset(years=5), pd.Timestamp(uk_entry_date))
+    date_range = pd.date_range(start=q_start, end=q_end, freq="D")
+
+    absence = _build_absence_series(
+        date_range, all_trips_full,
+        extra_2026, extra_2027,
+        buf_start_2026, buf_end_2026, buf_start_2027,
+    )
 
     total_absences = int(absence.sum())
 
-    # Check every rolling 12-month window (slide day by day)
     breaches: list[dict] = []
     worst_days = 0
     worst_window: dict | None = None
 
-    window_days = 365
-    for i in range(len(date_range) - window_days + 1):
-        window = absence.iloc[i : i + window_days]
-        days_absent = int(window.sum())
+    for i in range(len(date_range) - 365 + 1):
+        days_absent = int(absence.iloc[i : i + 365].sum())
         if days_absent > worst_days:
             worst_days = days_absent
             worst_window = {
                 "start": date_range[i].date(),
-                "end":   date_range[i + window_days - 1].date(),
+                "end":   date_range[i + 364].date(),
                 "days":  days_absent,
             }
         if days_absent > UKVI_LIMIT:
             breaches.append({
                 "start": date_range[i].date(),
-                "end":   date_range[i + window_days - 1].date(),
+                "end":   date_range[i + 364].date(),
                 "days":  days_absent,
             })
 
-    # Check for any single trip > 180 consecutive absence days
     long_trips: list[dict] = []
     for t in all_trips_full:
         ts = pd.Timestamp(t["date_out"])
         te = pd.Timestamp(t["date_in"])
-        # Only trips that overlap the qualifying period
         if te < q_start or ts > q_end:
             continue
         consecutive = max((te - ts).days - 1, 0)
@@ -222,16 +258,262 @@ def assess_ilr(
     eligible = len(breaches) == 0 and len(long_trips) == 0
 
     return {
-        "eligible":        eligible,
-        "breaches":        breaches,
-        "long_trips":      long_trips,
-        "worst_window":    worst_window,
-        "worst_days":      worst_days,
-        "total_absences":  total_absences,
+        "eligible":         eligible,
+        "breaches":         breaches,
+        "long_trips":       long_trips,
+        "worst_window":     worst_window,
+        "worst_days":       worst_days,
+        "total_absences":   total_absences,
         "qualifying_start": q_start.date(),
         "qualifying_end":   q_end.date(),
     }
 
+
+def compute_tight_windows(
+    uk_entry_date: date,
+    ilr_target_date: date,
+    all_trips_full: list[dict],
+    extra_2026: int,
+    extra_2027: int,
+    buf_start_2026: pd.Timestamp,
+    buf_end_2026: pd.Timestamp,
+    buf_start_2027: pd.Timestamp,
+    warn_threshold: int = 100,
+) -> list[dict]:
+    """
+    Find all calendar months in the future where the tightest rolling 12-month
+    window that *includes* that month has fewer than (180 - warn_threshold) days
+    of headroom (i.e. used > warn_threshold days).
+
+    Returns a list of dicts sorted by headroom ascending:
+      month_start, month_end, window_start, window_end,
+      used, headroom, risk_level ('critical'|'high'|'moderate')
+    """
+    full_range = pd.date_range(
+        start=pd.Timestamp(uk_entry_date),
+        end=pd.Timestamp(ilr_target_date),
+        freq="D",
+    )
+    absence = _build_absence_series(
+        full_range, all_trips_full,
+        extra_2026, extra_2027,
+        buf_start_2026, buf_end_2026, buf_start_2027,
+    )
+    cum = absence.values.cumsum()
+
+    def ws(s, e):
+        return int(cum[e]) if s == 0 else int(cum[e] - cum[s - 1])
+
+    date_to_idx = {d: i for i, d in enumerate(full_range)}
+    today_ts    = pd.Timestamp(TODAY)
+
+    # For each future calendar month, find the tightest 365-day window
+    # that overlaps that month
+    results = []
+    check_start = pd.Timestamp(TODAY.replace(day=1))
+    check_end   = pd.Timestamp(ilr_target_date)
+
+    month_cursor = check_start
+    while month_cursor <= check_end:
+        m_start = month_cursor
+        # last day of month
+        if m_start.month == 12:
+            m_end = pd.Timestamp(m_start.year + 1, 1, 1) - pd.Timedelta(days=1)
+        else:
+            m_end = pd.Timestamp(m_start.year, m_start.month + 1, 1) - pd.Timedelta(days=1)
+        m_end = min(m_end, check_end)
+
+        # Find the tightest (most-used) 365-day window that overlaps this month
+        tightest_used  = 0
+        tightest_ws    = None
+        tightest_we    = None
+
+        for i in range(len(full_range) - 364):
+            w_start = full_range[i]
+            w_end   = full_range[i + 364]
+            # Window must overlap the month AND end in the future
+            if w_end < today_ts:
+                continue
+            if w_end < m_start or w_start > m_end:
+                continue
+            used = ws(i, i + 364)
+            if used > tightest_used:
+                tightest_used  = used
+                tightest_ws    = w_start.date()
+                tightest_we    = w_end.date()
+
+        if tightest_ws is not None:
+            headroom = UKVI_LIMIT - tightest_used
+            if headroom < (UKVI_LIMIT - warn_threshold):
+                if headroom <= 50:
+                    risk = "critical"
+                elif headroom <= 70:
+                    risk = "high"
+                else:
+                    risk = "moderate"
+                results.append({
+                    "month_label":  m_start.strftime("%B %Y"),
+                    "month_start":  m_start.date(),
+                    "month_end":    m_end.date(),
+                    "window_start": tightest_ws,
+                    "window_end":   tightest_we,
+                    "used":         tightest_used,
+                    "headroom":     headroom,
+                    "risk":         risk,
+                })
+
+        # advance to next month
+        if m_start.month == 12:
+            month_cursor = pd.Timestamp(m_start.year + 1, 1, 1)
+        else:
+            month_cursor = pd.Timestamp(m_start.year, m_start.month + 1, 1)
+
+    # Deduplicate by binding window (same window_start/end can appear for consecutive months)
+    seen = set()
+    deduped = []
+    for r in sorted(results, key=lambda x: x["headroom"]):
+        key = (r["window_start"], r["window_end"])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(r)
+
+    return deduped
+
+
+def find_earliest_ilr_date(
+    uk_entry_date: date,
+    all_trips_full: list[dict],
+    extra_2026: int,
+    extra_2027: int,
+    buf_start_2026: pd.Timestamp,
+    buf_end_2026: pd.Timestamp,
+    buf_start_2027: pd.Timestamp,
+    search_end: date,
+) -> dict:
+    """
+    Scan forward day-by-day from (uk_entry_date + 5 years) to search_end,
+    returning the first date where the 5-year qualifying window has no rolling
+    12-month period exceeding 180 absence days.
+
+    The qualifying period anchor is the UK entry date (first day of actual
+    UK residence with permission), per Appendix Continuous Residence CR 1.1
+    and CR 2.1(d). Time outside the UK before first entry does not count.
+
+    Uses a cumulative sum for O(1) window queries.
+    """
+    # Earliest possible application = completion date − 28 days (CR 1.1 28-day rule)
+    # The qualifying period is always assessed as ending on the completion date,
+    # so we only need to check one effective q_end: ILR_COMPLETION.
+    # We scan from 28 days before completion to search_end.
+    earliest_possible = date(
+        uk_entry_date.year + 5,
+        uk_entry_date.month,
+        uk_entry_date.day,
+    ) - timedelta(days=28)
+
+    if earliest_possible > search_end:
+        return {"earliest_date": None, "days_to_go": None, "worst_days": None,
+                "remaining_budget": None, "binding_w_start": None, "binding_w_end": None}
+
+    # Build absence series from entry date to search_end
+    full_start = pd.Timestamp(uk_entry_date)
+    full_end   = pd.Timestamp(search_end)
+    full_range = pd.date_range(start=full_start, end=full_end, freq="D")
+
+    absence = _build_absence_series(
+        full_range, all_trips_full,
+        extra_2026, extra_2027,
+        buf_start_2026, buf_end_2026, buf_start_2027,
+    )
+
+    # Pre-compute cumulative sum for O(1) window queries
+    cum = absence.values.cumsum()
+
+    def window_sum(start_idx: int, end_idx: int) -> int:
+        if start_idx == 0:
+            return int(cum[end_idx])
+        return int(cum[end_idx] - cum[start_idx - 1])
+
+    date_to_idx = {d: i for i, d in enumerate(full_range)}
+
+    candidate = earliest_possible
+    # The qualifying period always ends on ILR_COMPLETION (CR 1.1 most-beneficial-date rule).
+    # So we only need to check one q_end. The scan finds the earliest *application* date
+    # from which that qualifying window is breach-free.
+    # Since the qualifying window is fixed, we check it once and return the earliest
+    # application date (earliest_possible) if it passes, or None if it fails.
+    q_end_ts    = pd.Timestamp(ILR_COMPLETION)
+    q_start_ts  = pd.Timestamp(uk_entry_date)
+    q_start_idx = date_to_idx.get(q_start_ts)
+    q_end_idx   = date_to_idx.get(q_end_ts)
+
+    while candidate <= search_end:
+        # For each candidate application date, qualifying window is fixed:
+        # q_start = uk_entry_date, q_end = ILR_COMPLETION (via 28-day rule)
+        if q_start_idx is None or q_end_idx is None:
+            candidate += timedelta(days=1)
+            continue
+
+        q_len = q_end_idx - q_start_idx + 1
+        if q_len < 365:
+            candidate += timedelta(days=1)
+            continue
+
+        # Check all 365-day windows within the qualifying period
+        breach_found = False
+        for i in range(q_start_idx, q_end_idx - 364 + 1):
+            if window_sum(i, i + 364) > UKVI_LIMIT:
+                breach_found = True
+                break
+
+        if not breach_found:
+            # Check no single trip > 180 consecutive days
+            long_trip = False
+            for t in all_trips_full:
+                ts = pd.Timestamp(t["date_out"])
+                te = pd.Timestamp(t["date_in"])
+                if te < q_start_ts or ts > q_end_ts:
+                    continue
+                if max((te - ts).days - 1, 0) > UKVI_LIMIT:
+                    long_trip = True
+                    break
+
+            if not long_trip:
+                days_to_go = (candidate - TODAY).days
+                worst = max(
+                    window_sum(i, i + 364)
+                    for i in range(q_start_idx, q_end_idx - 364 + 1)
+                )
+                # Remaining travel budget
+                today_idx = date_to_idx.get(pd.Timestamp(TODAY))
+                remaining_budget = UKVI_LIMIT
+                binding_w_start  = None
+                binding_w_end    = None
+                if today_idx is not None:
+                    for j in range(len(full_range) - 364):
+                        w_end_idx = j + 364
+                        if w_end_idx < today_idx:
+                            continue
+                        h = UKVI_LIMIT - window_sum(j, w_end_idx)
+                        if h < remaining_budget:
+                            remaining_budget = h
+                            binding_w_start  = full_range[j].date()
+                            binding_w_end    = full_range[w_end_idx].date()
+
+                return {
+                    "earliest_date":    candidate,
+                    "days_to_go":       days_to_go,
+                    "worst_days":       worst,
+                    "remaining_budget": remaining_budget,
+                    "binding_w_start":  binding_w_start,
+                    "binding_w_end":    binding_w_end,
+                }
+
+        # If breach found, no earlier application date will help (window is fixed)
+        break
+
+    return {"earliest_date": None, "days_to_go": None, "worst_days": None,
+            "remaining_budget": None, "binding_w_start": None, "binding_w_end": None}
 
 # ── Session state ─────────────────────────────────────────────────────────────
 if "edit_id" not in st.session_state:
@@ -552,21 +834,243 @@ for year in sorted(trips_by_year.keys(), reverse=True):
 
 st.divider()
 
+# ── Earliest ILR Date Prediction ──────────────────────────────────────────────
+st.subheader("📅 Earliest ILR Application Date")
+st.caption(
+    "Under CR 1.1 (Appendix Continuous Residence), you may apply up to **28 days before** "
+    "your 5-year completion date. The Home Office assesses the qualifying period as ending "
+    "on the completion date (most beneficial date rule). "
+    "Your 5-year completion date is **24 Nov 2027** (5 years from first UK entry). "
+    "Earliest application: **27 Oct 2027**. Updates live with every trip change."
+)
+
+with st.spinner("Calculating earliest eligible date…"):
+    prediction = find_earliest_ilr_date(
+        uk_entry_date=UK_ENTRY_DATE,
+        all_trips_full=all_trips_full,
+        extra_2026=extra_2026,
+        extra_2027=extra_2027,
+        buf_start_2026=BUFFER_2026_START,
+        buf_end_2026=BUFFER_2026_END,
+        buf_start_2027=start_2027,
+        search_end=ILR_SEARCH_END,
+    )
+
+if prediction["earliest_date"] is None:
+    st.markdown(
+        """
+        <div style="background:#fef2f2; border:1.5px solid #fca5a5; border-radius:12px;
+                    padding:20px 24px;">
+            <div style="font-size:1.2rem; font-weight:700; color:#dc2626; margin-bottom:4px;">
+                ⚠️ No eligible date found within the tracked period
+            </div>
+            <div style="color:#991b1b; font-size:0.9rem;">
+                Based on current and projected absences, no date before
+                24 Nov 2027 satisfies the continuous residence requirement.
+                Consider reducing planned travel.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+else:
+    ed          = prediction["earliest_date"]
+    days_to_go  = prediction["days_to_go"]
+    worst       = prediction["worst_days"]
+    headroom    = UKVI_LIMIT - worst
+
+    # Countdown label
+    if days_to_go < 0:
+        countdown_html = (
+            f'<span style="color:#15803d; font-weight:600;">Already passed '
+            f'({abs(days_to_go)} days ago)</span>'
+        )
+    elif days_to_go == 0:
+        countdown_html = '<span style="color:#15803d; font-weight:600;">Today!</span>'
+    else:
+        years_left  = days_to_go // 365
+        months_left = (days_to_go % 365) // 30
+        days_left   = days_to_go % 30
+        parts = []
+        if years_left:  parts.append(f"{years_left}y")
+        if months_left: parts.append(f"{months_left}m")
+        if days_left:   parts.append(f"{days_left}d")
+        countdown_html = (
+            f'<span style="color:#0369a1; font-weight:600;">'
+            f'{"  ".join(parts)} from today</span>'
+        )
+
+    headroom_color = "#15803d" if headroom >= 30 else "#d97706" if headroom >= 10 else "#dc2626"
+
+    st.markdown(
+        f"""
+        <div style="background:linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
+                    border:1.5px solid #7dd3fc; border-radius:14px;
+                    padding:24px 28px; margin-bottom:8px;">
+            <div style="font-size:0.85rem; color:#0369a1; font-weight:600;
+                        text-transform:uppercase; letter-spacing:0.05em; margin-bottom:6px;">
+                Earliest Eligible ILR Application Date
+            </div>
+            <div style="font-size:2.2rem; font-weight:800; color:#0c4a6e; margin-bottom:4px;">
+                {ed.strftime("%d %B %Y")}
+            </div>
+            <div style="font-size:1rem; margin-bottom:16px;">
+                {countdown_html}
+            </div>
+            <div style="display:flex; gap:24px; flex-wrap:wrap;">
+                <div>
+                    <div style="font-size:0.75rem; color:#64748b; text-transform:uppercase;">
+                        Qualifying Period
+                    </div>
+                    <div style="font-weight:600; color:#1e293b; font-size:0.9rem;">
+                        {UK_ENTRY_DATE.strftime("%d %b %Y")} → {ILR_COMPLETION.strftime("%d %b %Y")}
+                    </div>
+                </div>
+                <div>
+                    <div style="font-size:0.75rem; color:#64748b; text-transform:uppercase;">
+                        5-Year Completion Date
+                    </div>
+                    <div style="font-weight:600; color:#1e293b; font-size:0.9rem;">
+                        {ILR_COMPLETION.strftime("%d %b %Y")}
+                    </div>
+                </div>
+                <div>
+                    <div style="font-size:0.75rem; color:#64748b; text-transform:uppercase;">
+                        Worst Rolling Window
+                    </div>
+                    <div style="font-weight:600; color:#1e293b; font-size:0.9rem;">
+                        {worst} / 180 days
+                    </div>
+                </div>
+                <div>
+                    <div style="font-size:0.75rem; color:#64748b; text-transform:uppercase;">
+                        Headroom
+                    </div>
+                    <div style="font-weight:700; color:{headroom_color}; font-size:0.9rem;">
+                        {headroom} days to spare
+                    </div>
+                </div>
+                <div>
+                    <div style="font-size:0.75rem; color:#64748b; text-transform:uppercase;">
+                        Visa Granted / UK Entry
+                    </div>
+                    <div style="font-weight:600; color:#1e293b; font-size:0.9rem;">
+                        {VISA_GRANT_DATE.strftime("%d %b %Y")} / {UK_ENTRY_DATE.strftime("%d %b %Y")}
+                    </div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+st.divider()
+
+# ── Travel Caution Periods ────────────────────────────────────────────────────
+st.subheader("🚦 Travel Caution Periods")
+st.caption(
+    "Future calendar months where a rolling 12-month window is already tight. "
+    "Adding travel in these periods risks pushing a window over the 180-day limit "
+    "and could delay your ILR eligibility date. Updates live with every trip change."
+)
+
+tight_windows = compute_tight_windows(
+    uk_entry_date=UK_ENTRY_DATE,
+    ilr_target_date=ILR_SEARCH_END,
+    all_trips_full=all_trips_full,
+    extra_2026=extra_2026,
+    extra_2027=extra_2027,
+    buf_start_2026=BUFFER_2026_START,
+    buf_end_2026=BUFFER_2026_END,
+    buf_start_2027=start_2027,
+    warn_threshold=100,   # flag windows with < 80 days headroom (used > 100)
+)
+
+if not tight_windows:
+    st.success("No tight windows detected — all future rolling periods have comfortable headroom.")
+else:
+    RISK_CONFIG = {
+        "critical": {"color": "#dc2626", "bg": "#fef2f2", "border": "#fca5a5",
+                     "icon": "🔴", "label": "CRITICAL"},
+        "high":     {"color": "#d97706", "bg": "#fffbeb", "border": "#fcd34d",
+                     "icon": "🟠", "label": "HIGH RISK"},
+        "moderate": {"color": "#0369a1", "bg": "#f0f9ff", "border": "#7dd3fc",
+                     "icon": "🟡", "label": "CAUTION"},
+    }
+
+    # Summary counts
+    n_crit = sum(1 for w in tight_windows if w["risk"] == "critical")
+    n_high = sum(1 for w in tight_windows if w["risk"] == "high")
+    n_mod  = sum(1 for w in tight_windows if w["risk"] == "moderate")
+
+    summary_parts = []
+    if n_crit: summary_parts.append(f"🔴 **{n_crit} critical**")
+    if n_high: summary_parts.append(f"🟠 **{n_high} high risk**")
+    if n_mod:  summary_parts.append(f"🟡 **{n_mod} caution**")
+    st.markdown("  ·  ".join(summary_parts) + "  windows detected")
+
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+    cols_per_row = 3
+    for row_start in range(0, len(tight_windows), cols_per_row):
+        row_items = tight_windows[row_start : row_start + cols_per_row]
+        cols = st.columns(cols_per_row)
+        for col, w in zip(cols, row_items):
+            cfg = RISK_CONFIG[w["risk"]]
+            bar_pct = min(int(w["used"] / UKVI_LIMIT * 100), 100)
+            bar_color = cfg["color"]
+            col.markdown(
+                f"""
+                <div style="background:{cfg['bg']}; border:1.5px solid {cfg['border']};
+                            border-radius:12px; padding:14px 16px; margin-bottom:10px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center;
+                                margin-bottom:8px;">
+                        <div style="font-weight:700; font-size:0.95rem; color:{cfg['color']};">
+                            {cfg['icon']} {w['month_label']}
+                        </div>
+                        <span style="background:{cfg['color']}22; color:{cfg['color']};
+                                     font-size:0.7rem; padding:2px 8px; border-radius:8px;
+                                     font-weight:700;">{cfg['label']}</span>
+                    </div>
+                    <div style="font-size:0.78rem; color:#475569; margin-bottom:10px;">
+                        Binding window:<br>
+                        <strong>{w['window_start'].strftime('%d %b %Y')}
+                        → {w['window_end'].strftime('%d %b %Y')}</strong>
+                    </div>
+                    <div style="background:#e2e8f0; border-radius:6px;
+                                height:8px; margin-bottom:6px; overflow:hidden;">
+                        <div style="background:{bar_color}; width:{bar_pct}%;
+                                    height:100%; border-radius:6px;"></div>
+                    </div>
+                    <div style="display:flex; justify-content:space-between;
+                                font-size:0.78rem;">
+                        <span style="color:#64748b;">{w['used']} / 180 days used</span>
+                        <span style="font-weight:700; color:{cfg['color']};">
+                            {w['headroom']}d left
+                        </span>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+st.divider()
+
 # ── ILR Eligibility Assessment ────────────────────────────────────────────────
 st.subheader("🏛️ ILR Eligibility Assessment")
 st.caption(
     "Assesses eligibility under the **5-year Skilled Worker route** "
-    "(Appendix Continuous Residence). The qualifying period is the 5 years "
-    "immediately before your chosen application date. "
+    "(Appendix Continuous Residence). The qualifying period runs from your "
+    "first UK entry date (24 Nov 2022) to your chosen application date. "
     "The 180-day rule is checked across every rolling 12-month window in that period."
 )
 
-ILR_MIN_DATE = date(2027, 9, 1)
-ILR_MAX_DATE = date(2027, 11, 24)
+ILR_MIN_DATE = ILR_28DAY_EARLIEST   # 27 Oct 2027 — earliest application under 28-day rule
+ILR_MAX_DATE = ILR_COMPLETION       # 24 Nov 2027 — 5-year completion date
 
 ilr_date = st.date_input(
     "Select ILR application date",
-    value=date(2027, 11, 24),
+    value=ILR_28DAY_EARLIEST,
     min_value=ILR_MIN_DATE,
     max_value=ILR_MAX_DATE,
     format="DD/MM/YYYY",
@@ -578,6 +1082,7 @@ if ilr_date < ILR_MIN_DATE:
 else:
     result = assess_ilr(
         application_date=ilr_date,
+        uk_entry_date=UK_ENTRY_DATE,
         all_trips_full=all_trips_full,
         extra_2026=extra_2026,
         extra_2027=extra_2027,
