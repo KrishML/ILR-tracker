@@ -1,48 +1,131 @@
 import streamlit as st
 import pandas as pd
-from datetime import date
+from datetime import date, timedelta
 import plotly.graph_objects as go
+import openpyxl
+import os
 
-# ── Page config ──────────────────────────────────────────────────────────────
+import db
+
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="UK ILR Absence Tracker", layout="wide")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-START_DATE = "2022-10-22"
-END_DATE   = "2027-11-24"
-UKVI_LIMIT = 180
+START_DATE   = "2022-10-22"
+END_DATE     = "2027-11-24"
+UKVI_LIMIT   = 180
+EXCEL_FILE   = os.path.join(os.path.dirname(__file__), "ILR Vacation Tracker.xlsx")
+EXCEL_SHEETS = ["2022", "2023", "2024", "2025", "2026"]
+TODAY        = date.today()
 
-# Base trips (each counted using the UKVI "whole days" rule:
-# only dates strictly *between* departure and return are absence days)
-BASE_TRIPS = [
-    ("2022-10-22", "2022-11-23"), ("2022-11-29", "2022-12-10"),
-    ("2023-01-28", "2023-02-05"), ("2023-03-06", "2023-03-11"),
-    ("2023-05-11", "2023-05-29"), ("2023-06-16", "2023-06-19"),
-    ("2023-07-08", "2023-07-11"), ("2023-08-03", "2023-08-07"),
-    ("2023-08-18", "2023-08-21"), ("2023-09-01", "2023-09-05"),
-    ("2023-09-14", "2023-09-16"), ("2023-10-06", "2023-10-09"),
-    ("2023-10-13", "2023-10-29"), ("2023-11-11", "2023-11-15"),
-    ("2024-01-12", "2024-01-14"), ("2024-01-21", "2024-01-23"),
-    ("2024-01-31", "2024-02-07"), ("2024-03-19", "2024-04-08"),
-    ("2024-07-26", "2024-07-28"), ("2024-08-16", "2024-08-18"),
-    ("2024-08-29", "2024-09-02"), ("2024-09-28", "2024-10-01"),
-    ("2024-11-08", "2024-11-11"), ("2024-11-29", "2024-12-09"),
-    ("2024-12-20", "2024-12-30"), ("2025-01-09", "2025-01-27"),
-    ("2025-02-07", "2025-02-10"), ("2025-03-01", "2025-03-03"),
-    ("2025-03-06", "2025-03-16"), ("2025-04-16", "2025-04-22"),
-    ("2025-05-02", "2025-05-06"), ("2025-05-31", "2025-06-04"),
-    ("2025-06-13", "2025-06-16"), ("2025-06-27", "2025-07-06"),
-    ("2025-07-13", "2025-07-21"), ("2025-07-30", "2025-08-04"),
-    ("2025-08-11", "2025-08-17"), ("2025-08-22", "2025-08-25"),
-    ("2025-09-04", "2025-09-09"), ("2025-09-11", "2025-09-16"),
-    ("2025-11-07", "2025-11-10"), ("2025-11-21", "2025-11-24"),
-    ("2025-12-02", "2025-12-29"), ("2026-01-16", "2026-01-19"),
-    ("2026-01-23", "2026-01-26"), ("2026-02-05", "2026-02-18"),
-    ("2026-02-20", "2026-02-23"), ("2026-03-06", "2026-03-09"),
-    ("2026-03-14", "2026-03-16"), ("2026-03-28", "2026-03-30"),
-    ("2026-04-01", "2026-04-07"), ("2026-04-10", "2026-04-13"),
-    ("2026-04-17", "2026-04-20"), ("2026-05-01", "2026-05-10"),
-    ("2026-11-21", "2026-12-31"),
-]
+
+# ── DB init + Excel seed (runs once per process) ──────────────────────────────
+@st.cache_resource
+def initialise_db():
+    """Create schema and seed Excel trips into the DB. Runs once per server process."""
+    db.init_db()
+    excel_trips = _read_excel_trips(EXCEL_FILE)
+    seeded = db.seed_excel_trips(excel_trips)
+    return seeded
+
+
+@st.cache_data
+def _read_excel_trips(path: str) -> list[tuple[str, str, str]]:
+    """
+    Read (destination, date_out, date_in) triples from each year sheet.
+    Row layout: row 1 = title, row 2 = headers, rows 3+ = data.
+    Columns: A=Country, B=Date Out, C=Date In, D=Duration (formula, ignored).
+    """
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    trips: list[tuple[str, str, str]] = []
+    for sheet_name in EXCEL_SHEETS:
+        if sheet_name not in wb.sheetnames:
+            continue
+        ws = wb[sheet_name]
+        for row in list(ws.iter_rows(values_only=True))[2:]:  # skip title + header
+            dest, date_out, date_in = row[0], row[1], row[2]
+            if isinstance(date_out, date) and isinstance(date_in, date):
+                trips.append((
+                    str(dest) if dest else "—",
+                    date_out.strftime("%Y-%m-%d"),
+                    date_in.strftime("%Y-%m-%d"),
+                ))
+    wb.close()
+    return trips
+
+
+initialise_db()
+
+
+# ── Build absence dataframe ───────────────────────────────────────────────────
+@st.cache_data
+def build_dataframe(trips: tuple[tuple[str, str], ...]) -> pd.DataFrame:
+    """
+    Build a daily DataFrame with Absence and Rolling_365 columns.
+    Accepts a tuple (hashable) so Streamlit can cache on it.
+    UKVI whole-days rule: only days strictly between departure and return count.
+    """
+    df = pd.DataFrame({"Date": pd.date_range(start=START_DATE, end=END_DATE, freq="D")})
+    df["Absence"] = 0
+
+    for trip_start, trip_end in trips:
+        ts = pd.Timestamp(trip_start)
+        te = pd.Timestamp(trip_end)
+        df.loc[(df["Date"] > ts) & (df["Date"] < te), "Absence"] = 1
+
+    # Vectorised rolling 365-day sum
+    df["Rolling_365"] = (
+        df["Absence"]
+        .rolling(window=365, min_periods=1)
+        .sum()
+        .astype(int)
+    )
+    return df
+
+
+# ── Apply unplanned buffer days on top of a base dataframe ───────────────────
+def apply_buffer_days(
+    base_df: pd.DataFrame,
+    extra_2026: int,
+    extra_2027: int,
+    start_2026: pd.Timestamp,
+    start_2027: pd.Timestamp,
+    end_2026: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """
+    Overlay slider buffer days onto a copy of base_df, then recompute Rolling_365.
+    Days are added consecutively from the given start dates, skipping days already
+    marked as absences. end_2026 caps the window for 2026 buffer days.
+    """
+    df = base_df.copy()
+
+    def _fill(start: pd.Timestamp, n_days: int, end: pd.Timestamp | None = None) -> None:
+        remaining = n_days
+        for i in df.index:
+            if remaining <= 0:
+                break
+            row_date = df.at[i, "Date"]
+            if end is not None and row_date > end:
+                break
+            if row_date >= start and df.at[i, "Absence"] == 0:
+                df.at[i, "Absence"] = 1
+                remaining -= 1
+
+    if extra_2026 > 0:
+        _fill(start_2026, extra_2026, end_2026)
+    if extra_2027 > 0:
+        _fill(start_2027, extra_2027)
+
+    df["Rolling_365"] = (
+        df["Absence"].rolling(window=365, min_periods=1).sum().astype(int)
+    )
+    return df
+
+
+# ── Session state ─────────────────────────────────────────────────────────────
+if "edit_id" not in st.session_state:
+    st.session_state.edit_id = None   # DB id of the trip being edited
+
 
 # ── Title ─────────────────────────────────────────────────────────────────────
 st.title("🇬🇧 UK ILR Absence Tracker")
@@ -51,133 +134,183 @@ st.caption(
     "in any rolling 365-day period."
 )
 
-# ── Sliders ───────────────────────────────────────────────────────────────────
-st.subheader("Projected Future Travel")
+# ── Future trips manager ──────────────────────────────────────────────────────
+st.subheader("Planned Future Travel")
+
+# ── Add / Edit form ───────────────────────────────────────────────────────────
+editing    = st.session_state.edit_id is not None
+form_title = "✏️ Edit Trip" if editing else "➕ Add a Future Trip"
+
+with st.expander(form_title, expanded=editing):
+    if editing:
+        # Load the trip being edited from the DB
+        edit_trip = next(
+            (t for t in db.get_manual_trips() if t["id"] == st.session_state.edit_id),
+            None,
+        )
+        if edit_trip is None:
+            st.session_state.edit_id = None
+            st.rerun()
+        default_dest     = edit_trip["destination"]
+        default_date_out = date.fromisoformat(edit_trip["date_out"])
+        default_date_in  = date.fromisoformat(edit_trip["date_in"])
+    else:
+        default_dest     = ""
+        default_date_out = TODAY + timedelta(days=1)
+        default_date_in  = TODAY + timedelta(days=8)
+
+    with st.form("trip_form", clear_on_submit=True):
+        fc1, fc2, fc3 = st.columns([2, 1, 1])
+        with fc1:
+            dest  = st.text_input("Destination", value=default_dest)
+        with fc2:
+            d_out = st.date_input("Date Out", value=default_date_out, key="form_out")
+        with fc3:
+            d_in  = st.date_input("Date In",  value=default_date_in,  key="form_in")
+
+        fb1, fb2 = st.columns([1, 5])
+        with fb1:
+            submitted = st.form_submit_button("💾 Save" if editing else "➕ Add")
+        with fb2:
+            cancelled = st.form_submit_button("✖ Cancel") if editing else False
+
+    if cancelled:
+        st.session_state.edit_id = None
+        st.rerun()
+
+    if submitted:
+        if d_out >= d_in:
+            st.error("Date Out must be before Date In.")
+        else:
+            clean_dest = dest.strip() or "—"
+            if editing:
+                db.update_trip(st.session_state.edit_id, clean_dest, d_out.isoformat(), d_in.isoformat())
+                st.session_state.edit_id = None
+                st.success("Trip updated.")
+            else:
+                db.add_trip(clean_dest, d_out.isoformat(), d_in.isoformat())
+                st.success(f"Trip to {clean_dest} added.")
+            build_dataframe.clear()   # invalidate chart cache
+            st.rerun()
+
+# ── Manual trip list ──────────────────────────────────────────────────────────
+manual_trips = db.get_manual_trips()
+
+if manual_trips:
+    header = st.columns([2, 1, 1, 1, 1, 1])
+    for col, label in zip(header, ["Destination", "Date Out", "Date In", "Days Away", "", ""]):
+        col.markdown(f"**{label}**")
+
+    for trip in manual_trips:
+        d_out_dt     = date.fromisoformat(trip["date_out"])
+        d_in_dt      = date.fromisoformat(trip["date_in"])
+        absence_days = max((d_in_dt - d_out_dt).days - 1, 0)
+
+        row = st.columns([2, 1, 1, 1, 1, 1])
+        row[0].write(trip["destination"])
+        row[1].write(trip["date_out"])
+        row[2].write(trip["date_in"])
+        row[3].write(f"{absence_days}d")
+        if row[4].button("✏️", key=f"edit_{trip['id']}", help="Edit"):
+            st.session_state.edit_id = trip["id"]
+            st.rerun()
+        if row[5].button("🗑️", key=f"del_{trip['id']}", help="Delete"):
+            db.delete_trip(trip["id"])
+            build_dataframe.clear()
+            st.rerun()
+else:
+    st.info("No future trips added yet. Use the form above to plan ahead.")
+
+st.divider()
+
+# ── Build base dataframe from all DB trips ────────────────────────────────────
+all_trips = tuple(
+    (t["date_out"], t["date_in"]) for t in db.get_all_trips()
+)
+df_base = build_dataframe(all_trips)
+
+# ── Unplanned travel buffer sliders ──────────────────────────────────────────
+st.subheader("Unplanned Travel Buffer")
+st.caption(
+    "Simulate extra unplanned days away to see how much flexibility remains "
+    "before hitting the 180-day rolling limit."
+)
+
+# 2026 buffer: fixed window May 11 – Nov 12 2026 (gap between known trips)
+# 2027 buffer: from day after the last known 2027 departure
+BUFFER_2026_START = pd.Timestamp("2026-05-11")
+BUFFER_2026_END   = pd.Timestamp("2026-11-20")   # inclusive upper bound for filling
+
+def _last_departure_after(trips_tuple, year: int) -> pd.Timestamp:
+    """Day after the latest departure date for trips departing in the given year."""
+    outs = [
+        pd.Timestamp(t[0])
+        for t in trips_tuple
+        if pd.Timestamp(t[0]).year == year
+    ]
+    return (max(outs) + pd.Timedelta(days=1)) if outs else pd.Timestamp(f"{year}-01-01")
+
+start_2027 = _last_departure_after(all_trips, 2027)
 
 col_s1, col_s2 = st.columns(2)
 with col_s1:
-    extra_2026_days = st.slider(
-        "Extra 2026 Travel Days (Starts May 11, 2026)",
-        min_value=0, max_value=100, value=20,
-        key="slider_2026"
+    extra_2026 = st.slider(
+        "Extra 2026 days (11 May – 20 Nov 2026)",
+        min_value=0, max_value=120, value=0,
+        key="slider_2026",
     )
 with col_s2:
-    travel_2027_days = st.slider(
-        "2027 Travel Days (Starts Apr 25, 2027)",
-        min_value=0, max_value=180, value=45,
-        key="slider_2027"
+    extra_2027 = st.slider(
+        f"Extra 2027 days (from {start_2027.strftime('%d %b %Y')})",
+        min_value=0, max_value=180, value=0,
+        key="slider_2027",
     )
 
-# ── Calculation ───────────────────────────────────────────────────────────────
+# Apply buffer on top of the cached base (not persisted, purely for display)
+df = apply_buffer_days(df_base, extra_2026, extra_2027, BUFFER_2026_START, start_2027, BUFFER_2026_END)
 
-@st.cache_data
-def build_base_dataframe():
-    """Build the base DataFrame with base trips (cached to avoid recalculation)."""
-    df = pd.DataFrame({"Date": pd.date_range(start=START_DATE, end=END_DATE, freq="D")})
-    df["Absence"] = 0
-    
-    # Apply base trips using the UKVI "whole days" rule:
-    # A day is an absence only when it is STRICTLY between departure and return dates.
-    for trip_start, trip_end in BASE_TRIPS:
-        ts = pd.Timestamp(trip_start)
-        te = pd.Timestamp(trip_end)
-        mask = (df["Date"] > ts) & (df["Date"] < te)
-        df.loc[mask, "Absence"] = 1
-    
-    return df
-
-def apply_sliders(df, extra_2026_days, travel_2027_days):
-    """Apply slider values to a copy of the DataFrame."""
-    df = df.copy()
-    
-    # Apply Slider 1 — extra 2026 travel beginning 2026-05-11
-    date_2026 = pd.Timestamp("2026-05-11")
-    applied_2026 = 0
-    for i in range(len(df)):
-        if applied_2026 >= extra_2026_days:
-            break
-        if df.iloc[i]["Date"] >= date_2026:
-            df.iloc[i, df.columns.get_loc("Absence")] = 1
-            applied_2026 += 1
-    
-    # Apply Slider 2 — 2027 travel beginning 2027-04-25
-    date_2027 = pd.Timestamp("2027-04-25")
-    applied_2027 = 0
-    for i in range(len(df)):
-        if applied_2027 >= travel_2027_days:
-            break
-        if df.iloc[i]["Date"] >= date_2027:
-            df.iloc[i, df.columns.get_loc("Absence")] = 1
-            applied_2027 += 1
-    
-    # Calculate the rolling 365-day sum
-    # For each date, count absences in the window [date - 365 days : date]
-    rolling_365_values = []
-    for i in range(len(df)):
-        window_sum = 0
-        window_start = max(0, i - 364)  # 365 rows including current day
-        for j in range(window_start, i + 1):
-            window_sum += df.iloc[j]["Absence"]
-        rolling_365_values.append(window_sum)
-    
-    df["Rolling_365"] = rolling_365_values
-    return df
-
-# Build base and apply sliders
-df_base = build_base_dataframe()
-df = apply_sliders(df_base, extra_2026_days, travel_2027_days)
+st.divider()
 
 # ── Derived metrics ───────────────────────────────────────────────────────────
 max_peak = int(df["Rolling_365"].max())
 
 if max_peak < 150:
-    status_label = "✅ Safe"
+    status_label       = "✅ Safe"
     status_delta_color = "normal"
 elif max_peak <= UKVI_LIMIT:
-    status_label = "⚠️ Warning Zone"
+    status_label       = "⚠️ Warning Zone"
     status_delta_color = "off"
 else:
-    status_label = "🚨 LIMIT EXCEEDED"
+    status_label       = "🚨 LIMIT EXCEEDED"
     status_delta_color = "inverse"
 
-# ── Top metrics row ───────────────────────────────────────────────────────────
+# ── Summary metrics ───────────────────────────────────────────────────────────
 st.subheader("Summary")
 m1, m2, m3 = st.columns(3)
-
-m1.metric(
-    label="UKVI Limit",
-    value=f"{UKVI_LIMIT} Days",
-)
+m1.metric("UKVI Limit", f"{UKVI_LIMIT} Days")
 m2.metric(
-    label="Max Rolling Peak",
-    value=f"{max_peak} Days",
+    "Max Rolling Peak",
+    f"{max_peak} Days",
     delta=f"{max_peak - UKVI_LIMIT:+d} vs limit",
     delta_color=status_delta_color,
 )
-m3.metric(
-    label="Status",
-    value=status_label,
-)
+m3.metric("Status", status_label)
 
 st.divider()
 
 # ── Plotly chart ──────────────────────────────────────────────────────────────
 fig = go.Figure()
 
-# Blue line with filled area underneath
-fig.add_trace(
-    go.Scatter(
-        x=df["Date"],
-        y=df["Rolling_365"],
-        mode="lines",
-        name="Rolling 365-day absences",
-        line=dict(color="royalblue", width=2),
-        fill="tozeroy",
-        fillcolor="rgba(65, 105, 225, 0.15)",
-    )
-)
+fig.add_trace(go.Scatter(
+    x=df["Date"],
+    y=df["Rolling_365"],
+    mode="lines",
+    name="Rolling 365-day absences",
+    line=dict(color="royalblue", width=2),
+    fill="tozeroy",
+    fillcolor="rgba(65, 105, 225, 0.15)",
+))
 
-# Red dashed limit line at y=180
 fig.add_hline(
     y=UKVI_LIMIT,
     line_dash="dash",
@@ -187,9 +320,6 @@ fig.add_hline(
     annotation_position="top left",
     annotation_font_color="red",
 )
-
-# Note: Today marker removed due to Plotly datetime handling issues
-# The 180-day limit line is sufficient for tracking
 
 fig.update_layout(
     title="Rolling 365-Day UK Absences",
@@ -204,23 +334,107 @@ fig.update_layout(
     xaxis=dict(
         rangeslider=dict(visible=True, thickness=0.05),
         type="date",
-        rangeselector=dict(
-            buttons=list([
-                dict(count=1, label="1m", step="month"),
-                dict(count=3, label="3m", step="month"),
-                dict(count=6, label="6m", step="month"),
-                dict(count=1, label="YTD", step="year", stepmode="todate"),
-                dict(step="all", label="All"),
-            ])
-        ),
+        rangeselector=dict(buttons=[
+            dict(count=1,  label="1m",  step="month"),
+            dict(count=3,  label="3m",  step="month"),
+            dict(count=6,  label="6m",  step="month"),
+            dict(count=1,  label="YTD", step="year", stepmode="todate"),
+            dict(step="all", label="All"),
+        ]),
     ),
 )
 
-st.plotly_chart(fig, width="stretch")
+st.plotly_chart(fig, use_container_width=True)
 
-# ── Raw data expander ─────────────────────────────────────────────────────────
-with st.expander("View Raw Data"):
-    st.dataframe(
-        df[df["Absence"] == 1][["Date", "Absence", "Rolling_365"]].reset_index(drop=True),
-        width="stretch",
+# ── Trip history by year ──────────────────────────────────────────────────────
+st.subheader("Trip History")
+
+all_trips_full = db.get_all_trips()   # full dicts with destination + source
+
+# Group by departure year
+from collections import defaultdict
+trips_by_year: dict[int, list[dict]] = defaultdict(list)
+for t in all_trips_full:
+    year = int(t["date_out"][:4])
+    trips_by_year[year].append(t)
+
+YEAR_COLORS = {
+    2022: "#6366f1",   # indigo
+    2023: "#0ea5e9",   # sky blue
+    2024: "#10b981",   # emerald
+    2025: "#f59e0b",   # amber
+    2026: "#ef4444",   # red
+    2027: "#8b5cf6",   # violet
+}
+
+for year in sorted(trips_by_year.keys(), reverse=True):
+    year_trips = sorted(trips_by_year[year], key=lambda t: t["date_out"])
+    total_absence = sum(
+        max((date.fromisoformat(t["date_in"]) - date.fromisoformat(t["date_out"])).days - 1, 0)
+        for t in year_trips
     )
+    color = YEAR_COLORS.get(year, "#64748b")
+
+    # Year header with total
+    st.markdown(
+        f"""
+        <div style="display:flex; align-items:center; gap:12px; margin: 20px 0 8px 0;">
+            <div style="background:{color}; color:white; font-weight:700; font-size:1.1rem;
+                        padding:4px 16px; border-radius:20px;">{year}</div>
+            <div style="color:#64748b; font-size:0.9rem;">
+                {len(year_trips)} trip{"s" if len(year_trips) != 1 else ""} &nbsp;·&nbsp;
+                <strong>{total_absence}</strong> absence days
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Trip cards — 3 per row
+    cols_per_row = 3
+    for row_start in range(0, len(year_trips), cols_per_row):
+        row_trips = year_trips[row_start : row_start + cols_per_row]
+        cols = st.columns(cols_per_row)
+        for col, trip in zip(cols, row_trips):
+            d_out = date.fromisoformat(trip["date_out"])
+            d_in  = date.fromisoformat(trip["date_in"])
+            absence_days = max((d_in - d_out).days - 1, 0)
+            total_days   = (d_in - d_out).days
+
+            source_badge = (
+                f'<span style="background:#e0f2fe; color:#0369a1; font-size:0.7rem; '
+                f'padding:2px 8px; border-radius:10px; font-weight:600;">PLANNED</span>'
+                if trip["source"] == "manual"
+                else f'<span style="background:#f0fdf4; color:#166534; font-size:0.7rem; '
+                f'padding:2px 8px; border-radius:10px; font-weight:600;">EXCEL</span>'
+            )
+
+            col.markdown(
+                f"""
+                <div style="border:1px solid #e2e8f0; border-radius:12px; padding:14px 16px;
+                            border-left:4px solid {color}; background:#fafafa;
+                            margin-bottom:8px; min-height:110px;">
+                    <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:6px;">
+                        <div style="font-weight:600; font-size:0.95rem; color:#1e293b;
+                                    flex:1; margin-right:8px;">{trip["destination"]}</div>
+                        {source_badge}
+                    </div>
+                    <div style="color:#475569; font-size:0.82rem; margin-bottom:8px;">
+                        📅 {d_out.strftime("%d %b")} → {d_in.strftime("%d %b %Y")}
+                    </div>
+                    <div style="display:flex; gap:8px;">
+                        <span style="background:{color}22; color:{color}; font-size:0.78rem;
+                                     padding:2px 10px; border-radius:10px; font-weight:600;">
+                            {absence_days}d absent
+                        </span>
+                        <span style="background:#f1f5f9; color:#64748b; font-size:0.78rem;
+                                     padding:2px 10px; border-radius:10px;">
+                            {total_days}d total
+                        </span>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    st.markdown("<div style='margin-bottom:4px'></div>", unsafe_allow_html=True)
