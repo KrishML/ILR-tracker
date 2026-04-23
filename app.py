@@ -122,6 +122,117 @@ def apply_buffer_days(
     return df
 
 
+# ── ILR eligibility assessment ────────────────────────────────────────────────
+def assess_ilr(
+    application_date: date,
+    all_trips_full: list[dict],
+    extra_2026: int,
+    extra_2027: int,
+    buf_start_2026: pd.Timestamp,
+    buf_end_2026: pd.Timestamp,
+    buf_start_2027: pd.Timestamp,
+) -> dict:
+    """
+    Assess ILR eligibility under Appendix Continuous Residence (5-year Skilled Worker route).
+
+    Rules checked:
+      1. Qualifying period: 5 years immediately before application_date
+         (application_date - 5 years → application_date)
+      2. No rolling 12-month window within that period may exceed 180 absence days
+         (UKVI whole-days rule: departure and arrival days are NOT counted)
+      3. No single trip may exceed 180 consecutive absence days
+
+    Buffer days from sliders are included as synthetic absence days.
+    Returns a dict with keys: eligible, breaches, worst_window, total_absences,
+    qualifying_start, qualifying_end, checked_windows.
+    """
+    q_end   = pd.Timestamp(application_date)
+    q_start = q_end - pd.DateOffset(years=5)
+
+    # Build a daily absence series for the qualifying period
+    date_range = pd.date_range(start=q_start, end=q_end, freq="D")
+    absence = pd.Series(0, index=date_range)
+
+    for t in all_trips_full:
+        ts = pd.Timestamp(t["date_out"])
+        te = pd.Timestamp(t["date_in"])
+        # UKVI whole-days: strictly between departure and return
+        mask = (date_range > ts) & (date_range < te)
+        absence[mask] = 1
+
+    # Apply slider buffer days (2026 window)
+    def _apply_buffer(start: pd.Timestamp, end_cap: pd.Timestamp | None, n: int) -> None:
+        remaining = n
+        for d in date_range:
+            if remaining <= 0:
+                break
+            if end_cap is not None and d > end_cap:
+                break
+            if d >= start and absence[d] == 0:
+                absence[d] = 1
+                remaining -= 1
+
+    if extra_2026 > 0:
+        _apply_buffer(buf_start_2026, buf_end_2026, extra_2026)
+    if extra_2027 > 0:
+        _apply_buffer(buf_start_2027, None, extra_2027)
+
+    total_absences = int(absence.sum())
+
+    # Check every rolling 12-month window (slide day by day)
+    breaches: list[dict] = []
+    worst_days = 0
+    worst_window: dict | None = None
+
+    window_days = 365
+    for i in range(len(date_range) - window_days + 1):
+        window = absence.iloc[i : i + window_days]
+        days_absent = int(window.sum())
+        if days_absent > worst_days:
+            worst_days = days_absent
+            worst_window = {
+                "start": date_range[i].date(),
+                "end":   date_range[i + window_days - 1].date(),
+                "days":  days_absent,
+            }
+        if days_absent > UKVI_LIMIT:
+            breaches.append({
+                "start": date_range[i].date(),
+                "end":   date_range[i + window_days - 1].date(),
+                "days":  days_absent,
+            })
+
+    # Check for any single trip > 180 consecutive absence days
+    long_trips: list[dict] = []
+    for t in all_trips_full:
+        ts = pd.Timestamp(t["date_out"])
+        te = pd.Timestamp(t["date_in"])
+        # Only trips that overlap the qualifying period
+        if te < q_start or ts > q_end:
+            continue
+        consecutive = max((te - ts).days - 1, 0)
+        if consecutive > UKVI_LIMIT:
+            long_trips.append({
+                "destination": t["destination"],
+                "date_out": t["date_out"],
+                "date_in":  t["date_in"],
+                "days":     consecutive,
+            })
+
+    eligible = len(breaches) == 0 and len(long_trips) == 0
+
+    return {
+        "eligible":        eligible,
+        "breaches":        breaches,
+        "long_trips":      long_trips,
+        "worst_window":    worst_window,
+        "worst_days":      worst_days,
+        "total_absences":  total_absences,
+        "qualifying_start": q_start.date(),
+        "qualifying_end":   q_end.date(),
+    }
+
+
 # ── Session state ─────────────────────────────────────────────────────────────
 if "edit_id" not in st.session_state:
     st.session_state.edit_id = None   # DB id of the trip being edited
@@ -438,3 +549,136 @@ for year in sorted(trips_by_year.keys(), reverse=True):
             )
 
     st.markdown("<div style='margin-bottom:4px'></div>", unsafe_allow_html=True)
+
+st.divider()
+
+# ── ILR Eligibility Assessment ────────────────────────────────────────────────
+st.subheader("🏛️ ILR Eligibility Assessment")
+st.caption(
+    "Assesses eligibility under the **5-year Skilled Worker route** "
+    "(Appendix Continuous Residence). The qualifying period is the 5 years "
+    "immediately before your chosen application date. "
+    "The 180-day rule is checked across every rolling 12-month window in that period."
+)
+
+ILR_MIN_DATE = date(2027, 9, 1)
+ILR_MAX_DATE = date(2027, 11, 24)
+
+ilr_date = st.date_input(
+    "Select ILR application date",
+    value=date(2027, 11, 24),
+    min_value=ILR_MIN_DATE,
+    max_value=ILR_MAX_DATE,
+    format="DD/MM/YYYY",
+    key="ilr_date",
+)
+
+if ilr_date < ILR_MIN_DATE:
+    st.error(f"ILR application date must be on or after {ILR_MIN_DATE.strftime('%d %b %Y')}.")
+else:
+    result = assess_ilr(
+        application_date=ilr_date,
+        all_trips_full=all_trips_full,
+        extra_2026=extra_2026,
+        extra_2027=extra_2027,
+        buf_start_2026=BUFFER_2026_START,
+        buf_end_2026=BUFFER_2026_END,
+        buf_start_2027=start_2027,
+    )
+
+    # ── Verdict banner ────────────────────────────────────────────────────────
+    if result["eligible"]:
+        st.markdown(
+            """
+            <div style="background:#f0fdf4; border:1.5px solid #86efac; border-radius:12px;
+                        padding:20px 24px; margin-bottom:16px;">
+                <div style="font-size:1.5rem; font-weight:700; color:#15803d; margin-bottom:4px;">
+                    ✅ Eligible for ILR
+                </div>
+                <div style="color:#166534; font-size:0.95rem;">
+                    No rolling 12-month window exceeds 180 absence days during the qualifying period.
+                    You appear to meet the continuous residence requirement.
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            """
+            <div style="background:#fef2f2; border:1.5px solid #fca5a5; border-radius:12px;
+                        padding:20px 24px; margin-bottom:16px;">
+                <div style="font-size:1.5rem; font-weight:700; color:#dc2626; margin-bottom:4px;">
+                    ❌ Not Eligible — Continuous Residence Broken
+                </div>
+                <div style="color:#991b1b; font-size:0.95rem;">
+                    One or more rolling 12-month windows exceed the 180-day absence limit.
+                    Continuous residence is considered broken under Appendix Continuous Residence.
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # ── Key figures ───────────────────────────────────────────────────────────
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("Qualifying Period Start", result["qualifying_start"].strftime("%d %b %Y"))
+    a2.metric("Qualifying Period End",   result["qualifying_end"].strftime("%d %b %Y"))
+    a3.metric("Total Absence Days",      f"{result['total_absences']}d")
+    a4.metric(
+        "Worst Rolling Window",
+        f"{result['worst_days']}d",
+        delta=f"{result['worst_days'] - UKVI_LIMIT:+d} vs 180-day limit",
+        delta_color="inverse" if result["worst_days"] > UKVI_LIMIT else "normal",
+    )
+
+    # ── Worst window detail ───────────────────────────────────────────────────
+    if result["worst_window"]:
+        ww = result["worst_window"]
+        status_color = "#dc2626" if ww["days"] > UKVI_LIMIT else "#15803d"
+        st.markdown(
+            f"""
+            <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px;
+                        padding:14px 18px; margin-top:12px;">
+                <span style="font-weight:600; color:#334155;">Peak absence window: </span>
+                <span style="color:#475569;">
+                    {ww["start"].strftime("%d %b %Y")} → {ww["end"].strftime("%d %b %Y")}
+                </span>
+                &nbsp;·&nbsp;
+                <span style="font-weight:700; color:{status_color};">{ww["days"]} days absent</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # ── Breach details ────────────────────────────────────────────────────────
+    if result["breaches"]:
+        with st.expander(f"⚠️ {len(result['breaches'])} breach window(s) — click to expand"):
+            st.markdown(
+                "<div style='color:#64748b; font-size:0.85rem; margin-bottom:8px;'>"
+                "Each row is a 365-day window where absences exceeded 180 days.</div>",
+                unsafe_allow_html=True,
+            )
+            breach_df = pd.DataFrame(result["breaches"])
+            breach_df.columns = ["Window Start", "Window End", "Days Absent"]
+            breach_df["Over Limit By"] = breach_df["Days Absent"] - UKVI_LIMIT
+            st.dataframe(breach_df, use_container_width=True, hide_index=True)
+
+    # ── Long single-trip warnings ─────────────────────────────────────────────
+    if result["long_trips"]:
+        with st.expander(f"⚠️ {len(result['long_trips'])} trip(s) exceeding 180 consecutive days"):
+            for lt in result["long_trips"]:
+                st.markdown(
+                    f"- **{lt['destination']}** &nbsp; {lt['date_out']} → {lt['date_in']} "
+                    f"&nbsp; ({lt['days']} consecutive absence days)",
+                    unsafe_allow_html=True,
+                )
+
+    # ── Disclaimer ────────────────────────────────────────────────────────────
+    st.markdown(
+        "<div style='color:#94a3b8; font-size:0.78rem; margin-top:16px;'>"
+        "⚠️ This assessment is for informational purposes only and does not constitute legal advice. "
+        "Always consult a qualified immigration solicitor before submitting an ILR application."
+        "</div>",
+        unsafe_allow_html=True,
+    )
